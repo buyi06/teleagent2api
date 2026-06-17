@@ -1,0 +1,6 @@
+.git
+.env
+config.json
+teleagent2api.exe
+teleagent2api
+*.log

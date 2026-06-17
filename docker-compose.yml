@@ -1,0 +1,25 @@
+services:
+  teleagent2api:
+    build: .
+    container_name: teleagent2api
+    restart: unless-stopped
+    ports:
+      - "10000:10000"
+    environment:
+      - TELEAGENT_TOKEN=${TELEAGENT_TOKEN:-}
+      - TELEAGENT_INSTALL_ID=${TELEAGENT_INSTALL_ID:-}
+      - TELEAGENT_DEVICE_ID=${TELEAGENT_DEVICE_ID:-}
+      - API_KEY=${API_KEY:-sk-custom-your-key}
+      - TELEAGENT_TIMEOUT=${TELEAGENT_TIMEOUT:-120s}
+      - TELEAGENT_LOG_LEVEL=${TELEAGENT_LOG_LEVEL:-info}
+      - TELEAGENT_LOG_FORMAT=${TELEAGENT_LOG_FORMAT:-text}
+      - TELEAGENT_RETRY_COUNT=${TELEAGENT_RETRY_COUNT:-0}
+    volumes:
+      # Optional: Mount config.json if you prefer file-based config over env vars
+      # - ./config.json:/app/config.json:ro
+    networks:
+      - teleagent_net
+
+networks:
+  teleagent_net:
+    driver: bridge

@@ -1,0 +1,18 @@
+.env
+config.json
+*.exe
+teleagent2api
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+go.sum
