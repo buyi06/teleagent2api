@@ -99,9 +99,3 @@ curl -N http://localhost:10000/v1/chat/completions \
 
 1. 自行安装官方客户端并登录后找到 "~\AppData\Roaming\TeleAgent\app-auth" 目录中的 **state.json**  文件
 2. 该文件中拥有所需的 **'token(**此令牌有效期为一个月**)'**、**'deviceId'**、**'installId'** 
-
-
-## ⚠️ 免责声明
-
-- 本项目仅供学习和研究使用，不得用于任何商业用途或牟利。
-- 本项目不提供任何模型服务，仅作为接口转换网关使用。
