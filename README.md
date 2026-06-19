@@ -1,101 +1,202 @@
-<h1 align="center">🚀 TeleAgent2API</h1>
-<h3 align="center">OpenAI-Compatible API Gateway for TeleAgent</h3>
+# TeleAgent2API
+
+OpenAI-Compatible API Gateway for TeleAgent (星辰超级智能体)
 
 ---
 
-## 📖 简介
+## Features
 
-TeleAgent2API 是一个轻量级的 API 网关，将 TeleAgent 服务转换为标准的 OpenAI Chat Completions 接口。
+- Pure Go, single binary, minimal Docker image
+- Full OpenAI Chat Completions compatibility (streaming & non-streaming)
+- Tool calls / function calling support
+- Built-in API Key authentication
+- Request sanitization — strips unsupported params (logprobs, stop, n, etc.) that cause upstream errors
+- Response adapter — transforms upstream responses to strict OpenAI format
+  - Strips non-standard fields (`reasoning_content`, `request_id`, `system_fingerprint`, etc.)
+  - Cleans `usage` to only standard fields
+  - Streaming: skips reasoning-only chunks, `role` only in first content delta
+- Model metadata with context limits and max output tokens
+- Automatic `max_tokens` cap per model
+- 5xx retry with configurable count
+- Configurable via environment variables or `config.json`
 
-- ⚡ 纯 Go 实现，Docker 镜像极小
-- 🔐 内置 API Key 认证保护
-- 🌊 支持流式 (SSE) 和非流式响应
-- 🎯 兼容任何 OpenAI API 客户端
-- 📄 支持通过 `config.json` 或环境变量进行配置
+## Models
 
----
+| Model | Name | Context | Max Output | Tool Call | Reasoning |
+|-------|------|---------|------------|-----------|-----------|
+| `chat-lite` | 轻量 | 100K | 16,384 | Yes | No |
+| `chat-pro` | 旗舰 | 192K | 65,536 | Yes | Yes |
+| `chat-flash` | 极速 | 192K | 65,536 | Yes | No |
 
-##  ⚠️ 已知问题
-在接入Claude Code使用时，有时会出现 "API 调用参数有误，请检查文档" 报错，重试后正常
+## Quick Start
 
+### Docker (recommended)
 
-## 🚀 快速开始
-
-### Docker（推荐）
-
-1. 克隆代码或下载：
 ```bash
-git clone <repository_url>
+git clone https://github.com/buyi06/teleagent2api.git
 cd teleagent2api
 ```
 
-2. 复制环境变量模板并填入参数：
+Create `.env`:
+
 ```bash
-cp .env.example .env
-# 编辑 .env 文件填入您的 TELEAGENT_TOKEN 、DEVICE_ID 和 INSTALL_ID 
+TELEAGENT_TOKEN=your_jwt_token
+TELEAGENT_DEVICE_ID=your_device_id
+TELEAGENT_INSTALL_ID=your_install_id
+API_KEY=sk-your-custom-key
 ```
 
-3. 启动：
 ```bash
 docker compose up -d --build
 ```
 
-### 源码编译
+### From Source
 
 ```bash
 go mod tidy
 go build -o teleagent2api .
-```
-
-直接运行前，准备 `config.json` 或设置环境变量：
-```bash
 cp config.example.json config.json
+# edit config.json with your credentials
 ./teleagent2api
 ```
 
-### 验证
+### Verify
 
 ```bash
-# 健康检查
+# Health
 curl http://localhost:10000/health
 
-# 模型列表
+# Models (with metadata)
 curl http://localhost:10000/v1/models \
-  -H "Authorization: Bearer sk-custom-your-key"
+  -H "Authorization: Bearer sk-your-custom-key"
 
-# 聊天请求
-curl -N http://localhost:10000/v1/chat/completions \
-  -H "Authorization: Bearer sk-custom-your-key" \
+# Chat (non-streaming)
+curl http://localhost:10000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
-  -d '{"model":"chat-flash","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+  -d '{
+    "model": "chat-flash",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": false
+  }'
+
+# Chat (streaming)
+curl -N http://localhost:10000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "chat-flash",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+
+# Tool calls
+curl http://localhost:10000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "chat-flash",
+    "messages": [{"role": "user", "content": "weather in Tokyo?"}],
+    "stream": false,
+    "tools": [{"type": "function", "function": {
+      "name": "get_weather",
+      "description": "Get weather for a city",
+      "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+    }}]
+  }'
 ```
 
----
+## Claude Code Integration
 
-## ⚙️ 配置
+```bash
+export OPENAI_API_KEY=sk-your-custom-key
+export OPENAI_BASE_URL=http://your-host:10000/v1
+claude
+```
 
-支持环境变量和 `config.json` 两种方式。环境变量优先级高于配置文件（12-factor 合规）。默认读取 `config.json`，可通过 `TELEAGENT_CONFIG` 变量指定路径。
+Or in `.claude/settings.json`:
 
-| 环境变量 / JSON 键 | 默认值 | 说明 |
-|---------|--------|------|
-| `TELEAGENT_TOKEN` / `token` | 空 | (必填) 您的 TeleAgent JWT Token |
-| `TELEAGENT_INSTALL_ID` / `installId` | 空 | (必填) 安装 ID |
-| `TELEAGENT_DEVICE_ID` / `deviceId` | 空 | (必填) 设备 ID |
-| `API_KEY` / `apiKey` | 空 | 网关对外的 API Key，为空则不鉴权 |
-| `TELEAGENT2API_LISTEN` / `listen` | `:10000` | 监听地址 |
-| `TELEAGENT_UPSTREAM_KEY` / `upstreamApiKey` | (内置) | 上游 API Key，一般无需修改 |
-| `TELEAGENT_BASE_URL` / `baseURL` | `https://agent.teleai.com.cn` | 上游接口地址 |
-| `TELEAGENT_APP_VERSION` / `appVersion` | `2.0.0` | 客户端版本号 |
-| `TELEAGENT_USER_AGENT` / `userAgent` | (内置) | User-Agent |
-| `TELEAGENT_MODELS` / `models` | `chat-lite,chat-pro,chat-flash` | 可用模型列表 |
-| `TELEAGENT_TIMEOUT` / `timeout` | `120s` | 请求超时 |
-| `TELEAGENT_LOG_LEVEL` / `logLevel` | `info` | 日志级别 (debug/info/warn/error) |
-| `TELEAGENT_LOG_FORMAT` / `logFormat` | `text` | 日志格式 (text/json) |
-| `TELEAGENT_RETRY_COUNT` / `retryCount` | `0` | 上游 5xx 重试次数 |
+```json
+{
+  "env": {
+    "OPENAI_API_KEY": "sk-your-custom-key",
+    "OPENAI_BASE_URL": "http://your-host:10000/v1"
+  }
+}
+```
 
----
+## Configuration
 
-##  ❓ 如何获取令牌信息
+Environment variables take precedence over `config.json`.
 
-1. 自行安装官方客户端并登录后找到 "~\AppData\Roaming\TeleAgent\app-auth" 目录中的 **state.json**  文件
-2. 该文件中拥有所需的 **'token(**此令牌有效期为一个月**)'**、**'deviceId'**、**'installId'** 
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TELEAGENT_TOKEN` | — | **(required)** JWT token from TeleAgent |
+| `TELEAGENT_DEVICE_ID` | — | **(required)** Device ID |
+| `TELEAGENT_INSTALL_ID` | — | **(required)** Install ID |
+| `API_KEY` | — | Gateway API Key (empty = no auth) |
+| `TELEAGENT2API_LISTEN` | `:10000` | Listen address |
+| `TELEAGENT_UPSTREAM_KEY` | (built-in) | Upstream API Key |
+| `TELEAGENT_BASE_URL` | `https://agent.teleai.com.cn` | Upstream base URL |
+| `TELEAGENT_APP_VERSION` | `2.0.0` | Client version header |
+| `TELEAGENT_USER_AGENT` | (built-in) | User-Agent header |
+| `TELEAGENT_MODELS` | `chat-lite,chat-pro,chat-flash` | Available models |
+| `TELEAGENT_TIMEOUT` | `120s` | Request timeout |
+| `TELEAGENT_LOG_LEVEL` | `info` | Log level (debug/info/warn/error) |
+| `TELEAGENT_LOG_FORMAT` | `text` | Log format (text/json) |
+| `TELEAGENT_RETRY_COUNT` | `0` | Retry count on upstream 5xx |
+
+## Getting Credentials
+
+1. Install [TeleAgent](https://www.teleai.cn/) client and log in
+2. Find `state.json` at:
+   - **Windows:** `%APPDATA%\TeleAgent\app-auth\state.json`
+   - **macOS:** `~/Library/Application Support/TeleAgent/app-auth/state.json`
+   - **Linux:** `~/.config/TeleAgent/app-auth/state.json`
+3. Extract `token`, `deviceId`, and `installId`
+
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIs...",
+  "deviceId": "a1b2c3d4e5f6",
+  "installId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+}
+```
+
+> Note: `token` expires after one month. Re-login to refresh.
+
+## Architecture
+
+```
+Client (Claude Code / any OpenAI client)
+  │
+  ├── /health
+  ├── /v1/models
+  └── /v1/chat/completions
+        │
+        ▼
+  ┌─────────────────────────────┐
+  │   TeleAgent2API Gateway     │
+  │                             │
+  │  Auth → Sanitize Request    │
+  │       → HMAC Sign           │
+  │       → Forward to Upstream │
+  │       → Transform Response  │
+  │       → Return to Client    │
+  └─────────────────────────────┘
+        │
+        ▼
+  agent.teleai.com.cn
+  (TeleAgent Cloud API)
+```
+
+**Request flow:**
+1. Auth middleware validates API Key
+2. Adapter sanitizes request (strips unsupported OpenAI params, caps `max_tokens`)
+3. Proxy builds upstream request with HMAC signature
+4. Upstream response is transformed to strict OpenAI format
+5. Streaming: reasoning-only chunks are skipped, `role` emitted only once
+
+## License
+
+MIT
