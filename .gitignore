@@ -16,3 +16,6 @@ Thumbs.db
 
 # Build
 go.sum
+teleagent2api.exe
+*.exe
+*.bak
