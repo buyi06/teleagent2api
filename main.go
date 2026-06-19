@@ -46,14 +46,14 @@ func main() {
 
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("/v1/models", handler.Models(cfg))
-	apiMux.HandleFunc("/v1/chat/completions", handler.ChatCompletions(upProxy, httpClient, cfg.RetryCount, cfg.ModelMeta))
+	apiMux.HandleFunc("/v1/chat/completions", handler.ChatCompletions(upProxy, httpClient, cfg))
 
 	// Mount api endpoints under auth middleware
 	mux.Handle("/v1/", middleware.Auth(cfg.APIKey)(apiMux))
 
 	// Legacy endpoints
 	mux.Handle("/models", middleware.Auth(cfg.APIKey)(http.HandlerFunc(handler.Models(cfg))))
-	mux.Handle("/chat/completions", middleware.Auth(cfg.APIKey)(http.HandlerFunc(handler.ChatCompletions(upProxy, httpClient, cfg.RetryCount, cfg.ModelMeta))))
+	mux.Handle("/chat/completions", middleware.Auth(cfg.APIKey)(http.HandlerFunc(handler.ChatCompletions(upProxy, httpClient, cfg))))
 
 	// Stack: RequestID → MaxBodySize → AccessLog → mux
 	var h http.Handler = mux

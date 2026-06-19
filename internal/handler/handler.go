@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"teleagent2api/internal/adapter"
@@ -17,6 +18,9 @@ import (
 
 // modelCreated is a stable timestamp for the /v1/models response.
 var modelCreated = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+
+// credCounter is used for round-robin credential rotation.
+var credCounter uint64
 
 func Health() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +64,7 @@ func Models(cfg config.Config) http.HandlerFunc {
 	}
 }
 
-func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount int, modelMeta map[string]config.ModelMeta) http.HandlerFunc {
+func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -78,9 +82,13 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 
 		// Sanitize request: strip unsupported params that cause upstream errors
 		// and cap max_tokens to model limits
-		body = adapter.SanitizeRequest(body, modelMeta)
+		body = adapter.SanitizeRequest(body, cfg.ModelMeta)
 
-		upstreamReq, err := up.BuildRequest(r, body)
+		// Round-robin credential selection
+		credIdx := atomic.AddUint64(&credCounter, 1) % uint64(len(cfg.Credentials))
+		cred := cfg.Credentials[credIdx]
+
+		upstreamReq, err := up.BuildRequest(r, body, cred)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "failed to build upstream request",
 				slog.String("error", err.Error()),
@@ -90,13 +98,16 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 		}
 
 		var resp *http.Response
-		for attempt := 0; attempt <= retryCount; attempt++ {
+		for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
 			if attempt > 0 {
 				slog.WarnContext(r.Context(), "retrying upstream request",
 					slog.Int("attempt", attempt),
-					slog.Int("max_retries", retryCount),
+					slog.Int("max_retries", cfg.RetryCount),
 				)
-				upstreamReq, err = up.BuildRequest(r, body)
+				// Re-select credential on retry (different account might work)
+				credIdx = atomic.AddUint64(&credCounter, 1) % uint64(len(cfg.Credentials))
+				cred = cfg.Credentials[credIdx]
+				upstreamReq, err = up.BuildRequest(r, body, cred)
 				if err != nil {
 					slog.ErrorContext(r.Context(), "failed to rebuild upstream request",
 						slog.String("error", err.Error()),
@@ -107,7 +118,7 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 			}
 			resp, err = client.Do(upstreamReq)
 			if err != nil {
-				if attempt < retryCount {
+				if attempt < cfg.RetryCount {
 					continue
 				}
 				slog.ErrorContext(r.Context(), "upstream request failed after retries",
@@ -117,7 +128,7 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 				http.Error(w, "bad gateway", http.StatusBadGateway)
 				return
 			}
-			if resp.StatusCode >= 500 && attempt < retryCount {
+			if resp.StatusCode >= 500 && attempt < cfg.RetryCount {
 				resp.Body.Close()
 				resp = nil
 				continue

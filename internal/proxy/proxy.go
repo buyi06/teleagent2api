@@ -38,7 +38,7 @@ func NewUpstreamProxy(cfg config.Config) (*UpstreamProxy, error) {
 	}, nil
 }
 
-func (p *UpstreamProxy) BuildRequest(r *http.Request, body []byte) (*http.Request, error) {
+func (p *UpstreamProxy) BuildRequest(r *http.Request, body []byte, cred config.Credential) (*http.Request, error) {
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 	nonce, err := newUUID()
 	if err != nil {
@@ -46,7 +46,7 @@ func (p *UpstreamProxy) BuildRequest(r *http.Request, body []byte) (*http.Reques
 	}
 
 	bodySHA := sha256Hex(body)
-	derivedKey, err := buildDerivedKey(p.cfg.Token, p.cfg.InstallID, timestamp, nonce)
+	derivedKey, err := buildDerivedKey(cred.Token, cred.InstallID, timestamp, nonce)
 	if err != nil {
 		return nil, fmt.Errorf("build derived key: %w", err)
 	}
@@ -79,13 +79,13 @@ func (p *UpstreamProxy) BuildRequest(r *http.Request, body []byte) (*http.Reques
 	upstreamReq.Header.Set("Content-Type", firstNonEmpty(r.Header.Get("Content-Type"), "application/json"))
 	upstreamReq.Header.Set("User-Agent", p.cfg.UserAgent)
 	upstreamReq.Header.Set("X-App-Version", p.cfg.AppVersion)
-	upstreamReq.Header.Set("X-SuperAgent-Device-Id", p.cfg.DeviceID)
-	upstreamReq.Header.Set("X-SuperAgent-Install-Id", p.cfg.InstallID)
+	upstreamReq.Header.Set("X-SuperAgent-Device-Id", cred.DeviceID)
+	upstreamReq.Header.Set("X-SuperAgent-Install-Id", cred.InstallID)
 	upstreamReq.Header.Set("X-SuperAgent-Nonce", nonce)
 	upstreamReq.Header.Set("X-SuperAgent-Sign-Version", signVersion)
 	upstreamReq.Header.Set("X-SuperAgent-Signature", signature)
 	upstreamReq.Header.Set("X-SuperAgent-Timestamp", timestamp)
-	upstreamReq.Header.Set("X-Token", p.cfg.Token)
+	upstreamReq.Header.Set("X-Token", cred.Token)
 	upstreamReq.Header.Set("x-message-id", messageID)
 	upstreamReq.Header.Set("x-session-id", sessionID)
 	upstreamReq.Header.Set("Accept", firstNonEmpty(r.Header.Get("Accept"), "*/*"))

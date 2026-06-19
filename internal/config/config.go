@@ -22,6 +22,13 @@ type ModelMeta struct {
 	Temperature bool   `json:"temperature"`
 }
 
+// Credential holds a single TeleAgent account's auth data.
+type Credential struct {
+	Token     string `json:"token"`
+	DeviceID  string `json:"deviceId"`
+	InstallID string `json:"installId"`
+}
+
 type Config struct {
 	Token          string        `json:"-"`
 	DeviceID       string        `json:"deviceId"`
@@ -34,6 +41,7 @@ type Config struct {
 	Listen         string        `json:"listen,omitempty"`
 	Models         []string      `json:"models,omitempty"`
 	ModelMeta      map[string]ModelMeta `json:"model_meta,omitempty"`
+	Credentials    []Credential  `json:"credentials,omitempty"`
 	Timeout        time.Duration `json:"timeout,omitempty"`
 	LogLevel       string        `json:"logLevel,omitempty"`
 	LogFormat      string        `json:"logFormat,omitempty"`
@@ -42,20 +50,21 @@ type Config struct {
 
 // fileConfig mirrors Config but allows deserializing sensitive fields from file.
 type fileConfig struct {
-	Token          string   `json:"token"`
-	DeviceID       string   `json:"deviceId"`
-	InstallID      string   `json:"installId"`
-	APIKey         string   `json:"apiKey"`
-	UpstreamAPIKey string   `json:"upstreamApiKey"`
-	BaseURL        string   `json:"baseURL"`
-	AppVersion     string   `json:"appVersion"`
-	UserAgent      string   `json:"userAgent"`
-	Listen         string   `json:"listen"`
-	Models         []string `json:"models"`
-	Timeout        string   `json:"timeout"`
-	LogLevel       string   `json:"logLevel"`
-	LogFormat      string   `json:"logFormat"`
-	RetryCount     int      `json:"retryCount"`
+	Token          string       `json:"token"`
+	DeviceID       string       `json:"deviceId"`
+	InstallID      string       `json:"installId"`
+	APIKey         string       `json:"apiKey"`
+	UpstreamAPIKey string       `json:"upstreamApiKey"`
+	BaseURL        string       `json:"baseURL"`
+	AppVersion     string       `json:"appVersion"`
+	UserAgent      string       `json:"userAgent"`
+	Listen         string       `json:"listen"`
+	Models         []string     `json:"models"`
+	Credentials    []Credential `json:"credentials"`
+	Timeout        string       `json:"timeout"`
+	LogLevel       string       `json:"logLevel"`
+	LogFormat      string       `json:"logFormat"`
+	RetryCount     int          `json:"retryCount"`
 }
 
 func Load() Config {
@@ -66,7 +75,7 @@ func Load() Config {
 		AppVersion:     "2.0.0",
 		UserAgent:      "opencode/1.2.27 ai-sdk/provider-utils/3.0.20 runtime/bun/1.3.10",
 		Listen:         ":10000",
-		Timeout:        120 * time.Second,
+		Timeout:        300 * time.Second,
 		LogLevel:       "info",
 		LogFormat:      "text",
 		RetryCount:     0,
@@ -185,6 +194,27 @@ func Load() Config {
 
 	if len(c.ModelMeta) == 0 {
 		c.ModelMeta = DefaultModelMeta()
+	}
+
+	// Normalize credentials: if the primary token is set and not in the list,
+	// prepend it as the first credential.
+	if c.Token != "" {
+		primary := Credential{Token: c.Token, DeviceID: c.DeviceID, InstallID: c.InstallID}
+		if len(c.Credentials) == 0 {
+			c.Credentials = []Credential{primary}
+		} else {
+			// Check if primary is already in the list
+			found := false
+			for _, cred := range c.Credentials {
+				if cred.Token == c.Token {
+					found = true
+					break
+				}
+			}
+			if !found {
+				c.Credentials = append([]Credential{primary}, c.Credentials...)
+			}
+		}
 	}
 
 	return c
