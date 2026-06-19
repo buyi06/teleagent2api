@@ -139,6 +139,11 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 			return
 		}
 
+		// Remove Content-Length and Transfer-Encoding since we transform
+		// the response body and the length will differ from upstream's.
+		w.Header().Del("Content-Length")
+		w.Header().Del("Transfer-Encoding")
+
 		w.WriteHeader(resp.StatusCode)
 
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
@@ -245,6 +250,12 @@ var proxyResponseHeaderBlacklist = map[string]struct{}{
 	"upgrade":             {},
 	"set-cookie":          {},
 	"x-frame-options":     {},
+	"x-message-id":        {},
+	"x-session-id":        {},
+	"x-request-id":        {},
+	"x-trace-id":          {},
+	"x-nginx-header":      {},
+	"vary":                {},
 }
 
 func copyHeaders(dst, src http.Header) {
