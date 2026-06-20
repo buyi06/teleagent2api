@@ -9,8 +9,10 @@
   "userAgent": "opencode/1.2.27 ai-sdk/provider-utils/3.0.20 runtime/bun/1.3.10",
   "listen": ":10000",
   "models": ["chat-lite", "chat-pro", "chat-flash"],
-  "timeout": "120s",
+  "timeout": "20m",
+  "chunkTimeout": "15m",
   "logLevel": "info",
   "logFormat": "text",
-  "retryCount": 0
+  "retryCount": 0,
+  "emptyRetryCount": 2
 }

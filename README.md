@@ -11,13 +11,13 @@ OpenAI-Compatible API Gateway for TeleAgent (星辰超级智能体)
 - Tool calls / function calling support
 - Built-in API Key authentication
 - Request sanitization — strips unsupported params (logprobs, stop, n, etc.) that cause upstream errors
-- Response adapter — transforms upstream responses to strict OpenAI format
-  - Strips non-standard fields (`reasoning_content`, `request_id`, `system_fingerprint`, etc.)
+- Response adapter - transforms upstream responses to OpenAI-compatible format
+  - Preserves `reasoning_content` for clients that support reasoning streams
   - Cleans `usage` to only standard fields
-  - Streaming: skips reasoning-only chunks, `role` only in first content delta
+  - Streaming: buffers until first useful chunk so empty streams can be retried; preserves tool-call / finish chunks
 - Model metadata with context limits and max output tokens
 - Automatic `max_tokens` cap per model
-- 5xx retry with configurable count
+- Upstream/network retry and extra empty-response retry with configurable counts
 - Configurable via environment variables or `config.json`
 
 ## Models
@@ -141,10 +141,12 @@ Environment variables take precedence over `config.json`.
 | `TELEAGENT_APP_VERSION` | `2.0.0` | Client version header |
 | `TELEAGENT_USER_AGENT` | (built-in) | User-Agent header |
 | `TELEAGENT_MODELS` | `chat-lite,chat-pro,chat-flash` | Available models |
-| `TELEAGENT_TIMEOUT` | `120s` | Request timeout |
+| `TELEAGENT_TIMEOUT` | `20m` | Upstream response-header timeout / long-turn headroom |
+| `TELEAGENT_CHUNK_TIMEOUT` | `15m` | Maximum idle time while reading an upstream response chunk |
 | `TELEAGENT_LOG_LEVEL` | `info` | Log level (debug/info/warn/error) |
 | `TELEAGENT_LOG_FORMAT` | `text` | Log format (text/json) |
-| `TELEAGENT_RETRY_COUNT` | `0` | Retry count on upstream 5xx |
+| `TELEAGENT_RETRY_COUNT` | `0` | Retry count on upstream/network errors |
+| `TELEAGENT_EMPTY_RETRY_COUNT` | `2` | Extra retries for empty non-streaming or header-only streaming responses |
 
 ## Getting Credentials
 
@@ -195,7 +197,7 @@ Client (Claude Code / any OpenAI client)
 2. Adapter sanitizes request (strips unsupported OpenAI params, caps `max_tokens`)
 3. Proxy builds upstream request with HMAC signature
 4. Upstream response is transformed to strict OpenAI format
-5. Streaming: reasoning-only chunks are skipped, `role` emitted only once
+5. Streaming: empty/header-only streams are retried before headers are committed; useful reasoning/tool/finish chunks are preserved
 
 ## License
 

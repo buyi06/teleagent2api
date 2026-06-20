@@ -20,8 +20,8 @@ func main() {
 
 	initLogger(cfg)
 
-	if cfg.Token == "" || cfg.InstallID == "" || cfg.DeviceID == "" {
-		slog.Error("missing required environment variables", slog.String("missing", "TELEAGENT_TOKEN, TELEAGENT_INSTALL_ID, TELEAGENT_DEVICE_ID"))
+	if len(cfg.Credentials) == 0 {
+		slog.Error("missing TeleAgent credentials", slog.String("missing", "TELEAGENT_TOKEN/TELEAGENT_INSTALL_ID/TELEAGENT_DEVICE_ID or config.credentials[]"))
 		os.Exit(1)
 	}
 
@@ -37,8 +37,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = cfg.Timeout
 	httpClient := &http.Client{
-		Timeout: cfg.Timeout,
+		Transport: transport,
 	}
 
 	mux := http.NewServeMux()
@@ -62,10 +64,13 @@ func main() {
 	h = middleware.RequestID(h)
 
 	server := &http.Server{
-		Addr:         cfg.Listen,
-		Handler:      h,
-		ReadTimeout:  cfg.Timeout / 4,
-		WriteTimeout: cfg.Timeout * 2, // long enough for streaming
+		Addr:        cfg.Listen,
+		Handler:     h,
+		ReadTimeout: cfg.Timeout / 4,
+		// Do not use a total WriteTimeout for streaming completions. Long
+		// healthy streams are guarded by upstream header timeout and per-chunk
+		// idle timeout instead.
+		WriteTimeout: 0,
 		IdleTimeout:  cfg.Timeout,
 	}
 
