@@ -106,6 +106,66 @@ func TransformNonStreamingResponse(body []byte) []byte {
 	return out
 }
 
+// TransformNonStreamingResponseToSSE converts a valid non-streaming chat
+// completion into a minimal OpenAI-compatible SSE stream. This is a fallback
+// for upstream responses that ignore stream=true but still return HTTP 200
+// JSON. OpenAI clients that asked for streaming expect text/event-stream, not
+// a raw JSON object.
+func TransformNonStreamingResponseToSSE(body []byte) []byte {
+	transformed := TransformNonStreamingResponse(body)
+
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(transformed, &resp); err != nil {
+		return transformed
+	}
+
+	if objectRaw, ok := resp["object"]; ok {
+		var object string
+		if json.Unmarshal(objectRaw, &object) == nil && object == "chat.completion" {
+			resp["object"] = json.RawMessage(`"chat.completion.chunk"`)
+		}
+	}
+
+	if choicesRaw, ok := resp["choices"]; ok {
+		var choices []map[string]json.RawMessage
+		if err := json.Unmarshal(choicesRaw, &choices); err == nil {
+			for i, choice := range choices {
+				if msgRaw, ok := choice["message"]; ok {
+					var msg map[string]json.RawMessage
+					if json.Unmarshal(msgRaw, &msg) == nil {
+						delta := make(map[string]json.RawMessage)
+						for _, key := range []string{"role", "content", "reasoning_content", "tool_calls"} {
+							if v, ok := msg[key]; ok {
+								delta[key] = v
+							}
+						}
+						if _, ok := delta["role"]; !ok {
+							delta["role"] = json.RawMessage(`"assistant"`)
+						}
+						deltaOut, _ := json.Marshal(delta)
+						choice["delta"] = deltaOut
+						delete(choice, "message")
+						choices[i] = choice
+					}
+				}
+			}
+			choicesOut, _ := json.Marshal(choices)
+			resp["choices"] = choicesOut
+		}
+	}
+
+	payload, err := json.Marshal(resp)
+	if err != nil {
+		payload = transformed
+	}
+
+	out := make([]byte, 0, len(payload)+32)
+	out = append(out, "data: "...)
+	out = append(out, payload...)
+	out = append(out, "\n\ndata: [DONE]\n\n"...)
+	return out
+}
+
 // transformChoice rewrites a single choice object.
 // Preserves reasoning_content but ensures content is not empty when
 // reasoning_content exists.
@@ -178,6 +238,9 @@ func IsEmptyResponse(body []byte) bool {
 		if rc, ok := msg["reasoning_content"]; ok {
 			_ = json.Unmarshal(rc, &reasoning)
 		}
+		if toolCalls, ok := msg["tool_calls"]; ok && len(toolCalls) > 0 && string(toolCalls) != "null" && string(toolCalls) != "[]" {
+			return false
+		}
 		if content != "" || reasoning != "" {
 			return false
 		}
@@ -187,8 +250,8 @@ func IsEmptyResponse(body []byte) bool {
 
 // StreamChunkState tracks state across SSE chunks for transformation.
 type StreamChunkState struct {
-	roleSent       bool // whether we've emitted the role in a content delta
-	hasContent     bool // whether any chunk had actual content or reasoning
+	roleSent   bool // whether we've emitted the role in a content delta
+	hasContent bool // whether any chunk had actual content or reasoning
 }
 
 // NewStreamChunkState creates a new state tracker for streaming transformations.
@@ -235,6 +298,18 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 		}
 
 		_, hasContent := delta["content"]
+		_, hasToolCalls := delta["tool_calls"]
+		if hasToolCalls {
+			s.hasContent = true
+		}
+		hasUsage := false
+		if usageRaw, ok := chunk["usage"]; ok && len(usageRaw) > 0 && string(usageRaw) != "null" && string(usageRaw) != "{}" {
+			hasUsage = true
+		}
+		hasFinishReason := false
+		if finishRaw, ok := choice["finish_reason"]; ok && len(finishRaw) > 0 && string(finishRaw) != "null" && string(finishRaw) != `""` {
+			hasFinishReason = true
+		}
 
 		// Check if this is a reasoning-only chunk with no content at all
 		if hasReasoningContent && !hasContent {
@@ -263,8 +338,11 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 			var contentStr string
 			_ = json.Unmarshal(delta["content"], &contentStr)
 
-			// Skip empty content chunks without reasoning (usage updates)
-			if contentStr == "" && !hasReasoningContent {
+			// Skip empty content chunks only when they carry no other useful
+			// stream information. Some providers send tool_calls or
+			// finish_reason together with content:""; dropping those makes
+			// clients hang or lose function calls.
+			if contentStr == "" && !hasReasoningContent && !hasToolCalls && !hasFinishReason && !hasUsage {
 				continue
 			}
 			if contentStr != "" {

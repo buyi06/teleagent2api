@@ -30,41 +30,45 @@ type Credential struct {
 }
 
 type Config struct {
-	Token          string        `json:"-"`
-	DeviceID       string        `json:"deviceId"`
-	InstallID      string        `json:"-"`
-	APIKey         string        `json:"-"`
-	UpstreamAPIKey string        `json:"-"`
-	BaseURL        string        `json:"baseURL,omitempty"`
-	AppVersion     string        `json:"appVersion,omitempty"`
-	UserAgent      string        `json:"userAgent,omitempty"`
-	Listen         string        `json:"listen,omitempty"`
-	Models         []string      `json:"models,omitempty"`
-	ModelMeta      map[string]ModelMeta `json:"model_meta,omitempty"`
-	Credentials    []Credential  `json:"credentials,omitempty"`
-	Timeout        time.Duration `json:"timeout,omitempty"`
-	LogLevel       string        `json:"logLevel,omitempty"`
-	LogFormat      string        `json:"logFormat,omitempty"`
-	RetryCount     int           `json:"retryCount,omitempty"`
+	Token           string               `json:"-"`
+	DeviceID        string               `json:"deviceId"`
+	InstallID       string               `json:"-"`
+	APIKey          string               `json:"-"`
+	UpstreamAPIKey  string               `json:"-"`
+	BaseURL         string               `json:"baseURL,omitempty"`
+	AppVersion      string               `json:"appVersion,omitempty"`
+	UserAgent       string               `json:"userAgent,omitempty"`
+	Listen          string               `json:"listen,omitempty"`
+	Models          []string             `json:"models,omitempty"`
+	ModelMeta       map[string]ModelMeta `json:"model_meta,omitempty"`
+	Credentials     []Credential         `json:"credentials,omitempty"`
+	Timeout         time.Duration        `json:"timeout,omitempty"`
+	ChunkTimeout    time.Duration        `json:"chunkTimeout,omitempty"`
+	LogLevel        string               `json:"logLevel,omitempty"`
+	LogFormat       string               `json:"logFormat,omitempty"`
+	RetryCount      int                  `json:"retryCount,omitempty"`
+	EmptyRetryCount int                  `json:"emptyRetryCount,omitempty"`
 }
 
 // fileConfig mirrors Config but allows deserializing sensitive fields from file.
 type fileConfig struct {
-	Token          string       `json:"token"`
-	DeviceID       string       `json:"deviceId"`
-	InstallID      string       `json:"installId"`
-	APIKey         string       `json:"apiKey"`
-	UpstreamAPIKey string       `json:"upstreamApiKey"`
-	BaseURL        string       `json:"baseURL"`
-	AppVersion     string       `json:"appVersion"`
-	UserAgent      string       `json:"userAgent"`
-	Listen         string       `json:"listen"`
-	Models         []string     `json:"models"`
-	Credentials    []Credential `json:"credentials"`
-	Timeout        string       `json:"timeout"`
-	LogLevel       string       `json:"logLevel"`
-	LogFormat      string       `json:"logFormat"`
-	RetryCount     int          `json:"retryCount"`
+	Token           string       `json:"token"`
+	DeviceID        string       `json:"deviceId"`
+	InstallID       string       `json:"installId"`
+	APIKey          string       `json:"apiKey"`
+	UpstreamAPIKey  string       `json:"upstreamApiKey"`
+	BaseURL         string       `json:"baseURL"`
+	AppVersion      string       `json:"appVersion"`
+	UserAgent       string       `json:"userAgent"`
+	Listen          string       `json:"listen"`
+	Models          []string     `json:"models"`
+	Credentials     []Credential `json:"credentials"`
+	Timeout         string       `json:"timeout"`
+	ChunkTimeout    string       `json:"chunkTimeout"`
+	LogLevel        string       `json:"logLevel"`
+	LogFormat       string       `json:"logFormat"`
+	RetryCount      int          `json:"retryCount"`
+	EmptyRetryCount int          `json:"emptyRetryCount"`
 }
 
 func Load() Config {
@@ -75,10 +79,15 @@ func Load() Config {
 		AppVersion:     "2.0.0",
 		UserAgent:      "opencode/1.2.27 ai-sdk/provider-utils/3.0.20 runtime/bun/1.3.10",
 		Listen:         ":10000",
-		Timeout:        300 * time.Second,
-		LogLevel:       "info",
-		LogFormat:      "text",
-		RetryCount:     0,
+		// Match TeleAgent desktop's NewApi provider headroom:
+		// timeout=20min and chunkTimeout=15min. A shorter total HTTP client
+		// timeout is a common cause of long coding turns stopping mid-stream.
+		Timeout:         20 * time.Minute,
+		ChunkTimeout:    15 * time.Minute,
+		LogLevel:        "info",
+		LogFormat:       "text",
+		RetryCount:      0,
+		EmptyRetryCount: 2,
 	}
 
 	configPath := getEnv("TELEAGENT_CONFIG", "config.json")
@@ -121,9 +130,17 @@ func Load() Config {
 			if len(fc.Models) > 0 {
 				c.Models = fc.Models
 			}
+			if len(fc.Credentials) > 0 {
+				c.Credentials = fc.Credentials
+			}
 			if fc.Timeout != "" {
 				if d, err := time.ParseDuration(fc.Timeout); err == nil {
 					c.Timeout = d
+				}
+			}
+			if fc.ChunkTimeout != "" {
+				if d, err := time.ParseDuration(fc.ChunkTimeout); err == nil {
+					c.ChunkTimeout = d
 				}
 			}
 			if fc.LogLevel != "" {
@@ -134,6 +151,9 @@ func Load() Config {
 			}
 			if fc.RetryCount > 0 {
 				c.RetryCount = fc.RetryCount
+			}
+			if fc.EmptyRetryCount >= 0 {
+				c.EmptyRetryCount = fc.EmptyRetryCount
 			}
 		}
 	}
@@ -171,6 +191,11 @@ func Load() Config {
 			c.Timeout = d
 		}
 	}
+	if v, ok := os.LookupEnv("TELEAGENT_CHUNK_TIMEOUT"); ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.ChunkTimeout = d
+		}
+	}
 	if v, ok := os.LookupEnv("TELEAGENT_LOG_LEVEL"); ok {
 		c.LogLevel = v
 	}
@@ -180,6 +205,11 @@ func Load() Config {
 	if v, ok := os.LookupEnv("TELEAGENT_RETRY_COUNT"); ok {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			c.RetryCount = n
+		}
+	}
+	if v, ok := os.LookupEnv("TELEAGENT_EMPTY_RETRY_COUNT"); ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.EmptyRetryCount = n
 		}
 	}
 
@@ -216,6 +246,11 @@ func Load() Config {
 			}
 		}
 	}
+	if c.Token == "" && len(c.Credentials) > 0 {
+		c.Token = c.Credentials[0].Token
+		c.DeviceID = c.Credentials[0].DeviceID
+		c.InstallID = c.Credentials[0].InstallID
+	}
 
 	return c
 }
@@ -230,8 +265,8 @@ func (c Config) SafeSummary() string {
 	if c.APIKey != "" {
 		apiKeyHint = fmt.Sprintf("%s…", c.APIKey[:min(4, len(c.APIKey))])
 	}
-	return fmt.Sprintf("listen=%s upstream=%s token=%s apiKey=%s models=%v timeout=%s logLevel=%s retryCount=%d",
-		c.Listen, c.BaseURL, tokenHint, apiKeyHint, c.Models, c.Timeout, c.LogLevel, c.RetryCount,
+	return fmt.Sprintf("listen=%s upstream=%s token=%s apiKey=%s models=%v timeout=%s chunkTimeout=%s logLevel=%s retryCount=%d emptyRetryCount=%d",
+		c.Listen, c.BaseURL, tokenHint, apiKeyHint, c.Models, c.Timeout, c.ChunkTimeout, c.LogLevel, c.RetryCount, c.EmptyRetryCount,
 	)
 }
 

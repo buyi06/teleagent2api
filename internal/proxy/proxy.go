@@ -88,6 +88,9 @@ func (p *UpstreamProxy) BuildRequest(r *http.Request, body []byte, cred config.C
 	upstreamReq.Header.Set("X-Token", cred.Token)
 	upstreamReq.Header.Set("x-message-id", messageID)
 	upstreamReq.Header.Set("x-session-id", sessionID)
+	if lastEventID := strings.TrimSpace(r.Header.Get("Last-Event-ID")); lastEventID != "" {
+		upstreamReq.Header.Set("Last-Event-ID", lastEventID)
+	}
 	upstreamReq.Header.Set("Accept", firstNonEmpty(r.Header.Get("Accept"), "*/*"))
 	upstreamReq.Header.Set("Accept-Encoding", "identity")
 	upstreamReq.Header.Set("Connection", "close")

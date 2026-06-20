@@ -99,3 +99,12 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 func (w *statusWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
+
+// Flush preserves http.Flusher through the logging wrapper.
+// Without this, streaming responses may be buffered by intermediaries and
+// clients can appear to hang or disconnect mid-generation.
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
