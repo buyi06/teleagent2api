@@ -134,12 +134,22 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 				slog.Int("upstream_status", resp.StatusCode),
 			)
 
-			// If upstream returned a client error (4xx), pass through — no retry
+			// If upstream returned an error (4xx/5xx), map business error codes to proper HTTP status
 			if resp.StatusCode >= 400 {
-				copyHeaders(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				io.Copy(w, resp.Body)
+				raw, readErr := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				if readErr != nil {
+					slog.ErrorContext(r.Context(), "failed to read error response",
+						slog.String("error", readErr.Error()),
+					)
+					http.Error(w, "bad gateway", http.StatusBadGateway)
+					return
+				}
+				mappedStatus := mapUpstreamErrorCode(resp.StatusCode, raw)
+				copyHeaders(w.Header(), resp.Header)
+				w.Header().Del("Content-Length")
+				w.WriteHeader(mappedStatus)
+				w.Write(raw)
 				return
 			}
 
@@ -205,7 +215,47 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 }
 
 
-// transformFlushCopy reads SSE lines from upstream, transforms each data
+// mapUpstreamErrorCode maps TeleAgent business error codes to proper HTTP status codes.
+// TeleAgent returns HTTP 500 for business errors with a code like 40001, 50001, etc.
+// We remap these to semantically correct HTTP status codes.
+func mapUpstreamErrorCode(httpStatus int, body []byte) int {
+	var errResp struct {
+		Code int `json:"code"`
+	}
+	if json.Unmarshal(body, &errResp) != nil || errResp.Code == 0 {
+		return httpStatus
+	}
+
+	code := errResp.Code
+	switch {
+	case code >= 40000 && code < 50000:
+		switch code {
+		case 40001:
+			return http.StatusBadRequest
+		case 40101, 40301:
+			return http.StatusUnauthorized
+		case 40401:
+			return http.StatusNotFound
+		case 42901:
+			return http.StatusTooManyRequests
+		default:
+			return http.StatusBadRequest
+		}
+	case code >= 50000 && code < 60000:
+		// Model not found / no route is a client error (wrong model name),
+		// not a server error.
+		switch code {
+		case 50001:
+			return http.StatusNotFound
+		default:
+			return http.StatusBadGateway
+		}
+	default:
+		return httpStatus
+	}
+}
+
+// transformFlushCopy reads SSE lines from upstream, transforms each
 // payload to be OpenAI-compatible, and flushes to the client.
 func transformFlushCopy(w http.ResponseWriter, r *http.Request, body io.Reader, state *adapter.StreamChunkState) {
 	flusher, ok := w.(http.Flusher)
