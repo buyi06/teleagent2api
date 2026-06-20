@@ -142,9 +142,53 @@ func transformChoice(choice map[string]json.RawMessage) map[string]json.RawMessa
 	return choice
 }
 
+// IsEmptyResponse returns true if a non-streaming response has no usable
+// content — both content and reasoning_content are empty or missing.
+func IsEmptyResponse(body []byte) bool {
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false
+	}
+
+	choicesRaw, ok := resp["choices"]
+	if !ok {
+		return true
+	}
+	var choices []map[string]json.RawMessage
+	if err := json.Unmarshal(choicesRaw, &choices); err != nil {
+		return false
+	}
+	if len(choices) == 0 {
+		return true
+	}
+
+	for _, choice := range choices {
+		msgRaw, ok := choice["message"]
+		if !ok {
+			continue
+		}
+		var msg map[string]json.RawMessage
+		if err := json.Unmarshal(msgRaw, &msg); err != nil {
+			continue
+		}
+		var content, reasoning string
+		if c, ok := msg["content"]; ok {
+			_ = json.Unmarshal(c, &content)
+		}
+		if rc, ok := msg["reasoning_content"]; ok {
+			_ = json.Unmarshal(rc, &reasoning)
+		}
+		if content != "" || reasoning != "" {
+			return false
+		}
+	}
+	return true
+}
+
 // StreamChunkState tracks state across SSE chunks for transformation.
 type StreamChunkState struct {
-	roleSent bool // whether we've emitted the role in a content delta
+	roleSent       bool // whether we've emitted the role in a content delta
+	hasContent     bool // whether any chunk had actual content or reasoning
 }
 
 // NewStreamChunkState creates a new state tracker for streaming transformations.
@@ -206,6 +250,7 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 				delta["role"] = json.RawMessage(`"assistant"`)
 				s.roleSent = true
 			}
+			s.hasContent = true
 			skipChunk = false
 			deltaOut, _ := json.Marshal(delta)
 			choice["delta"] = deltaOut
@@ -221,6 +266,9 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 			// Skip empty content chunks without reasoning (usage updates)
 			if contentStr == "" && !hasReasoningContent {
 				continue
+			}
+			if contentStr != "" {
+				s.hasContent = true
 			}
 		}
 
@@ -269,4 +317,9 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 		return data, false
 	}
 	return out, false
+}
+
+// HasContent returns true if at least one chunk contained actual content or reasoning.
+func (s *StreamChunkState) HasContent() bool {
+	return s.hasContent
 }

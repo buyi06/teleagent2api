@@ -11,7 +11,7 @@ FROM alpine:3.21
 RUN apk --no-cache add ca-certificates
 WORKDIR /app
 COPY --from=builder /build/teleagent2api .
-EXPOSE 10000
+EXPOSE 7823
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD wget -qO- http://localhost:${TELEAGENT2API_PORT:-10000}/health || exit 1
+    CMD wget -qO- http://localhost:7823/health || exit 1
 CMD ["./teleagent2api"]

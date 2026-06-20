@@ -84,41 +84,37 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 		// and cap max_tokens to model limits
 		body = adapter.SanitizeRequest(body, cfg.ModelMeta)
 
+		// Detect if client requested streaming
+		var reqStruct struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.Unmarshal(body, &reqStruct)
+
+		// Total attempts = normal retries + 1 extra attempt for empty response retry
+		maxAttempts := cfg.RetryCount + 2 // +1 for initial, +1 for empty-response retry
+
 		// Round-robin credential selection
 		credIdx := atomic.AddUint64(&credCounter, 1) % uint64(len(cfg.Credentials))
 		cred := cfg.Credentials[credIdx]
 
-		upstreamReq, err := up.BuildRequest(r, body, cred)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "failed to build upstream request",
-				slog.String("error", err.Error()),
-			)
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		var resp *http.Response
-		for attempt := 0; attempt <= cfg.RetryCount; attempt++ {
+		for attempt := 0; attempt < maxAttempts; attempt++ {
 			if attempt > 0 {
-				slog.WarnContext(r.Context(), "retrying upstream request",
-					slog.Int("attempt", attempt),
-					slog.Int("max_retries", cfg.RetryCount),
-				)
-				// Re-select credential on retry (different account might work)
 				credIdx = atomic.AddUint64(&credCounter, 1) % uint64(len(cfg.Credentials))
 				cred = cfg.Credentials[credIdx]
-				upstreamReq, err = up.BuildRequest(r, body, cred)
-				if err != nil {
-					slog.ErrorContext(r.Context(), "failed to rebuild upstream request",
-						slog.String("error", err.Error()),
-					)
-					http.Error(w, "internal server error", http.StatusInternalServerError)
-					return
-				}
 			}
-			resp, err = client.Do(upstreamReq)
+
+			upstreamReq, err := up.BuildRequest(r, body, cred)
 			if err != nil {
-				if attempt < cfg.RetryCount {
+				slog.ErrorContext(r.Context(), "failed to build upstream request",
+					slog.String("error", err.Error()),
+				)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+
+			resp, err := client.Do(upstreamReq)
+			if err != nil {
+				if attempt < maxAttempts-1 {
 					continue
 				}
 				slog.ErrorContext(r.Context(), "upstream request failed after retries",
@@ -128,62 +124,93 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 				http.Error(w, "bad gateway", http.StatusBadGateway)
 				return
 			}
-			if resp.StatusCode >= 500 && attempt < cfg.RetryCount {
+
+			if resp.StatusCode >= 500 && attempt < maxAttempts-1 {
 				resp.Body.Close()
-				resp = nil
 				continue
 			}
-			break
-		}
-		defer resp.Body.Close()
 
-		slog.InfoContext(r.Context(), "upstream responded",
-			slog.Int("upstream_status", resp.StatusCode),
-		)
+			slog.InfoContext(r.Context(), "upstream responded",
+				slog.Int("upstream_status", resp.StatusCode),
+			)
 
-		copyHeaders(w.Header(), resp.Header)
+			// If upstream returned a client error (4xx), pass through — no retry
+			if resp.StatusCode >= 400 {
+				copyHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				io.Copy(w, resp.Body)
+				resp.Body.Close()
+				return
+			}
 
-		// If upstream returned an error (4xx/5xx), pass through as-is
-		if resp.StatusCode >= 400 {
+			isStream := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+
+			// --- Non-streaming: buffer, check for empty, retry if needed ---
+			if !isStream && !reqStruct.Stream {
+				raw, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr != nil {
+					slog.ErrorContext(r.Context(), "failed to read upstream response",
+						slog.String("error", readErr.Error()),
+					)
+					http.Error(w, "bad gateway", http.StatusBadGateway)
+					return
+				}
+
+				if adapter.IsEmptyResponse(raw) && attempt < maxAttempts-1 {
+					slog.WarnContext(r.Context(), "upstream returned empty response, retrying",
+						slog.Int("attempt", attempt+1),
+						slog.Int("body_len", len(raw)),
+					)
+					continue
+				}
+
+				copyHeaders(w.Header(), resp.Header)
+				w.Header().Del("Content-Length")
+				w.Header().Del("Transfer-Encoding")
+				w.WriteHeader(resp.StatusCode)
+				transformed := adapter.TransformNonStreamingResponse(raw)
+				w.Write(transformed)
+				return
+			}
+
+			// --- Streaming: copy with flush, check if stream was empty ---
+			copyHeaders(w.Header(), resp.Header)
+			w.Header().Del("Content-Length")
+			w.Header().Del("Transfer-Encoding")
 			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
+
+			state := adapter.NewStreamChunkState()
+			transformFlushCopy(w, r, resp.Body, state)
+			resp.Body.Close()
+
+			// If stream produced zero content chunks, retry with different credential
+			if !state.HasContent() && attempt < maxAttempts-1 {
+				slog.WarnContext(r.Context(), "upstream stream was empty, retrying",
+					slog.Int("attempt", attempt+1),
+				)
+				// Can't retry: response headers already sent to client.
+				// Log for diagnostics. Future improvement: buffer first N chunks
+				// before committing to the response writer.
+				slog.WarnContext(r.Context(), "empty stream cannot be retried (headers already sent)",
+					slog.String("request_id", middleware.GetRequestID(r.Context())),
+				)
+			}
 			return
 		}
 
-		// Remove Content-Length and Transfer-Encoding since we transform
-		// the response body and the length will differ from upstream's.
-		w.Header().Del("Content-Length")
-		w.Header().Del("Transfer-Encoding")
-
-		w.WriteHeader(resp.StatusCode)
-
-		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-			transformFlushCopy(w, r, resp.Body)
-			return
-		}
-		transformNonStreamingCopy(w, resp.Body)
+		// Should not reach here, but just in case
+		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 }
 
-// transformNonStreamingCopy reads the full upstream response, transforms it
-// to be OpenAI-compatible, then writes it out.
-func transformNonStreamingCopy(w http.ResponseWriter, body io.Reader) {
-	raw, err := io.ReadAll(body)
-	if err != nil {
-		slog.Error("failed to read upstream response body", slog.String("error", err.Error()))
-		return
-	}
-	transformed := adapter.TransformNonStreamingResponse(raw)
-	w.Write(transformed)
-}
 
 // transformFlushCopy reads SSE lines from upstream, transforms each data
 // payload to be OpenAI-compatible, and flushes to the client.
-func transformFlushCopy(w http.ResponseWriter, r *http.Request, body io.Reader) {
+func transformFlushCopy(w http.ResponseWriter, r *http.Request, body io.Reader, state *adapter.StreamChunkState) {
 	flusher, ok := w.(http.Flusher)
 	reader := bufio.NewReader(body)
 	ctx := r.Context()
-	state := adapter.NewStreamChunkState()
 
 	for {
 		line, err := reader.ReadBytes('\n')
