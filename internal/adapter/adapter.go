@@ -6,6 +6,33 @@ import (
 	"teleagent2api/internal/config"
 )
 
+// TransformOptions controls compatibility fixes applied while translating
+// TeleAgent responses to OpenAI-compatible responses.
+type TransformOptions struct {
+	// ExposeReasoning preserves provider-specific reasoning_content fields.
+	// Keep this disabled for OpenAI-compatible coding clients such as Claude Code:
+	// many clients either ignore this field or treat it like visible assistant
+	// output, which makes streams noisy and wastes output tokens.
+	ExposeReasoning bool
+
+	// ReasoningContentFallback copies reasoning_content into content when the
+	// final content is empty. This preserves the previous behavior for users who
+	// explicitly opt in, but should stay disabled by default because it can turn
+	// hidden chain-of-thought-style text into visible assistant output.
+	ReasoningContentFallback bool
+
+	// ModelAlias rewrites top-level response model IDs back to the model name the
+	// client requested (for example chat-flash instead of the upstream GLM name).
+	ModelAlias string
+}
+
+func legacyTransformOptions() TransformOptions {
+	return TransformOptions{
+		ExposeReasoning:          true,
+		ReasoningContentFallback: true,
+	}
+}
+
 // allowedRequestFields lists the fields we forward to the upstream API.
 // Any field not in this list is stripped before forwarding.
 var allowedRequestFields = map[string]bool{
@@ -23,6 +50,16 @@ var allowedRequestFields = map[string]bool{
 // preventing "API 调用参数有误" errors from Claude Code requests.
 // It also caps max_tokens to the model's maximum output limit.
 func SanitizeRequest(body []byte, modelMeta map[string]config.ModelMeta) []byte {
+	return SanitizeRequestWithOptions(body, modelMeta, 0)
+}
+
+// SanitizeRequestWithOptions strips unsupported request fields, caps
+// max_tokens to the model limit, and optionally raises too-small max_tokens.
+// TeleAgent models can spend a large part of the completion budget on
+// reasoning_content before emitting final content. Claude Code often sends
+// small max_tokens for probes; without a floor those requests can be truncated
+// before any usable answer or tool call is produced.
+func SanitizeRequestWithOptions(body []byte, modelMeta map[string]config.ModelMeta, minOutputTokens int) []byte {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return body // not valid JSON, forward as-is
@@ -35,19 +72,42 @@ func SanitizeRequest(body []byte, modelMeta map[string]config.ModelMeta) []byte 
 		}
 	}
 
-	// Resolve model name and cap max_tokens
+	// Resolve model name, raise too-small max_tokens, and cap to model limit.
+	maxOutput := 0
 	if modelRaw, ok := cleaned["model"]; ok {
 		var modelName string
 		_ = json.Unmarshal(modelRaw, &modelName)
 		if meta, ok := modelMeta[modelName]; ok {
-			if maxTokensRaw, ok := cleaned["max_tokens"]; ok {
-				var maxTokens int
-				_ = json.Unmarshal(maxTokensRaw, &maxTokens)
-				if maxTokens > meta.MaxOutput {
-					capped, _ := json.Marshal(meta.MaxOutput)
-					cleaned["max_tokens"] = capped
-				}
+			maxOutput = meta.MaxOutput
+		}
+	}
+	if minOutputTokens > 0 || maxOutput > 0 {
+		targetMin := minOutputTokens
+		if maxOutput > 0 && targetMin > maxOutput {
+			targetMin = maxOutput
+		}
+
+		maxTokens := 0
+		hasMaxTokens := false
+		if maxTokensRaw, ok := cleaned["max_tokens"]; ok {
+			if err := json.Unmarshal(maxTokensRaw, &maxTokens); err == nil {
+				hasMaxTokens = true
 			}
+		}
+
+		switch {
+		case hasMaxTokens && maxTokens > 0:
+			if targetMin > 0 && maxTokens < targetMin {
+				maxTokens = targetMin
+			}
+			if maxOutput > 0 && maxTokens > maxOutput {
+				maxTokens = maxOutput
+			}
+			out, _ := json.Marshal(maxTokens)
+			cleaned["max_tokens"] = out
+		case !hasMaxTokens && targetMin > 0:
+			out, _ := json.Marshal(targetMin)
+			cleaned["max_tokens"] = out
 		}
 	}
 
@@ -59,12 +119,22 @@ func SanitizeRequest(body []byte, modelMeta map[string]config.ModelMeta) []byte 
 }
 
 // TransformNonStreamingResponse rewrites an upstream non-streaming response
-// to be fully OpenAI-compatible. reasoning_content is preserved as it is
-// supported by OpenAI o1/o3 models and clients like Claude Code.
+// using the legacy behavior kept for direct package callers.
 func TransformNonStreamingResponse(body []byte) []byte {
+	return TransformNonStreamingResponseWithOptions(body, legacyTransformOptions())
+}
+
+// TransformNonStreamingResponseWithOptions rewrites an upstream non-streaming
+// response according to the provided compatibility options.
+func TransformNonStreamingResponseWithOptions(body []byte, opts TransformOptions) []byte {
 	var resp map[string]json.RawMessage
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return body
+	}
+
+	if opts.ModelAlias != "" {
+		modelOut, _ := json.Marshal(opts.ModelAlias)
+		resp["model"] = modelOut
 	}
 
 	// Transform choices — keep reasoning_content, just ensure content isn't empty
@@ -74,7 +144,7 @@ func TransformNonStreamingResponse(body []byte) []byte {
 			return body
 		}
 		for i, choice := range choices {
-			choices[i] = transformChoice(choice)
+			choices[i] = transformChoice(choice, opts)
 		}
 		choicesOut, _ := json.Marshal(choices)
 		resp["choices"] = choicesOut
@@ -112,7 +182,13 @@ func TransformNonStreamingResponse(body []byte) []byte {
 // JSON. OpenAI clients that asked for streaming expect text/event-stream, not
 // a raw JSON object.
 func TransformNonStreamingResponseToSSE(body []byte) []byte {
-	transformed := TransformNonStreamingResponse(body)
+	return TransformNonStreamingResponseToSSEWithOptions(body, legacyTransformOptions())
+}
+
+// TransformNonStreamingResponseToSSEWithOptions converts a valid non-streaming
+// response into a minimal SSE stream using the same response-transform options.
+func TransformNonStreamingResponseToSSEWithOptions(body []byte, opts TransformOptions) []byte {
+	transformed := TransformNonStreamingResponseWithOptions(body, opts)
 
 	var resp map[string]json.RawMessage
 	if err := json.Unmarshal(transformed, &resp); err != nil {
@@ -169,7 +245,7 @@ func TransformNonStreamingResponseToSSE(body []byte) []byte {
 // transformChoice rewrites a single choice object.
 // Preserves reasoning_content but ensures content is not empty when
 // reasoning_content exists.
-func transformChoice(choice map[string]json.RawMessage) map[string]json.RawMessage {
+func transformChoice(choice map[string]json.RawMessage, opts TransformOptions) map[string]json.RawMessage {
 	msgRaw, ok := choice["message"]
 	if !ok {
 		return choice
@@ -180,13 +256,11 @@ func transformChoice(choice map[string]json.RawMessage) map[string]json.RawMessa
 		return choice
 	}
 
-	// Keep reasoning_content — it's valid in OpenAI extended format
-	// But if content is empty and reasoning_content exists, move it to content
 	var content string
 	if cRaw, ok := msg["content"]; ok {
 		_ = json.Unmarshal(cRaw, &content)
 	}
-	if content == "" {
+	if content == "" && opts.ReasoningContentFallback {
 		if rcRaw, ok := msg["reasoning_content"]; ok {
 			var rc string
 			_ = json.Unmarshal(rcRaw, &rc)
@@ -195,6 +269,9 @@ func transformChoice(choice map[string]json.RawMessage) map[string]json.RawMessa
 				msg["content"] = contentOut
 			}
 		}
+	}
+	if !opts.ExposeReasoning {
+		delete(msg, "reasoning_content")
 	}
 
 	msgOut, _ := json.Marshal(msg)
@@ -252,11 +329,18 @@ func IsEmptyResponse(body []byte) bool {
 type StreamChunkState struct {
 	roleSent   bool // whether we've emitted the role in a content delta
 	hasContent bool // whether any chunk had actual content or reasoning
+	opts       TransformOptions
 }
 
 // NewStreamChunkState creates a new state tracker for streaming transformations.
 func NewStreamChunkState() *StreamChunkState {
-	return &StreamChunkState{}
+	return &StreamChunkState{opts: legacyTransformOptions()}
+}
+
+// NewStreamChunkStateWithOptions creates a stream transformer with explicit
+// compatibility options.
+func NewStreamChunkStateWithOptions(opts TransformOptions) *StreamChunkState {
+	return &StreamChunkState{opts: opts}
 }
 
 // TransformChunk rewrites a single SSE data payload to be OpenAI-compatible.
@@ -266,6 +350,11 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 	var chunk map[string]json.RawMessage
 	if err := json.Unmarshal(data, &chunk); err != nil {
 		return data, false
+	}
+
+	if s.opts.ModelAlias != "" {
+		modelOut, _ := json.Marshal(s.opts.ModelAlias)
+		chunk["model"] = modelOut
 	}
 
 	choicesRaw, ok := chunk["choices"]
@@ -294,7 +383,10 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 		hasReasoningContent := false
 		if _, ok := delta["reasoning_content"]; ok {
 			hasReasoningContent = true
-			// Keep reasoning_content — clients like Claude Code support it
+			// Keep reasoning_content only when explicitly requested.
+		}
+		if hasReasoningContent && !s.opts.ExposeReasoning {
+			delete(delta, "reasoning_content")
 		}
 
 		_, hasContent := delta["content"]
@@ -311,12 +403,20 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 			hasFinishReason = true
 		}
 
-		// Check if this is a reasoning-only chunk with no content at all
+		// Check if this is a reasoning-only chunk with no content at all.
+		// When reasoning is hidden, drop these prelude chunks entirely so
+		// OpenAI-compatible coding clients only see final content/tool/finish
+		// chunks.
 		if hasReasoningContent && !hasContent {
+			if !s.opts.ExposeReasoning && !hasToolCalls && !hasFinishReason && !hasUsage {
+				continue
+			}
 			// Check for empty reasoning_content (chat-pro sends these during phases)
 			var rcStr string
-			_ = json.Unmarshal(delta["reasoning_content"], &rcStr)
-			if rcStr == "" && len(delta) <= 2 { // only role + empty reasoning
+			if raw, ok := delta["reasoning_content"]; ok {
+				_ = json.Unmarshal(raw, &rcStr)
+			}
+			if rcStr == "" && len(delta) <= 2 && !hasToolCalls && !hasFinishReason && !hasUsage { // only role + empty reasoning
 				// Skip pure empty reasoning chunks
 				continue
 			}

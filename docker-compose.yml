@@ -16,6 +16,9 @@ services:
       - TELEAGENT_LOG_FORMAT=${TELEAGENT_LOG_FORMAT:-text}
       - TELEAGENT_RETRY_COUNT=${TELEAGENT_RETRY_COUNT:-0}
       - TELEAGENT_EMPTY_RETRY_COUNT=${TELEAGENT_EMPTY_RETRY_COUNT:-2}
+      - TELEAGENT_EXPOSE_REASONING=${TELEAGENT_EXPOSE_REASONING:-false}
+      - TELEAGENT_REASONING_TO_CONTENT=${TELEAGENT_REASONING_TO_CONTENT:-false}
+      - TELEAGENT_MIN_OUTPUT_TOKENS=${TELEAGENT_MIN_OUTPUT_TOKENS:-1024}
     volumes:
       # Optional: Mount config.json if you prefer file-based config over env vars
       # - ./config.json:/app/config.json:ro

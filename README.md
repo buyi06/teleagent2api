@@ -12,11 +12,13 @@ OpenAI-Compatible API Gateway for TeleAgent (星辰超级智能体)
 - Built-in API Key authentication
 - Request sanitization — strips unsupported params (logprobs, stop, n, etc.) that cause upstream errors
 - Response adapter - transforms upstream responses to OpenAI-compatible format
-  - Preserves `reasoning_content` for clients that support reasoning streams
+  - Hides `reasoning_content` by default for Claude Code / OpenAI-compatible coding clients
+  - Optional reasoning passthrough for clients that explicitly support reasoning streams
   - Cleans `usage` to only standard fields
   - Streaming: buffers until first useful chunk so empty streams can be retried; preserves tool-call / finish chunks
+  - Rewrites upstream model IDs back to the requested model alias
 - Model metadata with context limits and max output tokens
-- Automatic `max_tokens` cap per model
+- Automatic `max_tokens` floor and cap per model
 - Upstream/network retry and extra empty-response retry with configurable counts
 - Configurable via environment variables or `config.json`
 
@@ -108,6 +110,12 @@ curl http://localhost:10000/v1/chat/completions \
 
 ## Claude Code Integration
 
+The default configuration is tuned for Claude Code:
+
+- `reasoning_content` is hidden by default so hidden chain-of-thought-style text is not rendered as assistant output.
+- `reasoning_content` is **not** copied into `content` by default.
+- Too-small `max_tokens` values are raised to `TELEAGENT_MIN_OUTPUT_TOKENS` (default `1024`) before forwarding upstream. TeleAgent models may spend early output tokens on reasoning before final content/tool calls, so very small budgets can otherwise truncate useful output.
+
 ```bash
 export OPENAI_API_KEY=sk-your-custom-key
 export OPENAI_BASE_URL=http://your-host:10000/v1
@@ -147,6 +155,9 @@ Environment variables take precedence over `config.json`.
 | `TELEAGENT_LOG_FORMAT` | `text` | Log format (text/json) |
 | `TELEAGENT_RETRY_COUNT` | `0` | Retry count on upstream/network errors |
 | `TELEAGENT_EMPTY_RETRY_COUNT` | `2` | Extra retries for empty non-streaming or header-only streaming responses |
+| `TELEAGENT_EXPOSE_REASONING` | `false` | Preserve provider-specific `reasoning_content` in responses |
+| `TELEAGENT_REASONING_TO_CONTENT` | `false` | Copy `reasoning_content` into `content` when content is empty (legacy/debug only) |
+| `TELEAGENT_MIN_OUTPUT_TOKENS` | `1024` | Raise missing or too-small `max_tokens` before forwarding upstream; set `0` to disable |
 
 ## Getting Credentials
 
@@ -194,10 +205,10 @@ Client (Claude Code / any OpenAI client)
 
 **Request flow:**
 1. Auth middleware validates API Key
-2. Adapter sanitizes request (strips unsupported OpenAI params, caps `max_tokens`)
+2. Adapter sanitizes request (strips unsupported OpenAI params, raises/caps `max_tokens`)
 3. Proxy builds upstream request with HMAC signature
 4. Upstream response is transformed to strict OpenAI format
-5. Streaming: empty/header-only streams are retried before headers are committed; useful reasoning/tool/finish chunks are preserved
+5. Streaming: empty/header-only streams are retried before headers are committed; useful content/tool/finish chunks are preserved
 
 ## License
 
