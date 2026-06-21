@@ -30,45 +30,51 @@ type Credential struct {
 }
 
 type Config struct {
-	Token           string               `json:"-"`
-	DeviceID        string               `json:"deviceId"`
-	InstallID       string               `json:"-"`
-	APIKey          string               `json:"-"`
-	UpstreamAPIKey  string               `json:"-"`
-	BaseURL         string               `json:"baseURL,omitempty"`
-	AppVersion      string               `json:"appVersion,omitempty"`
-	UserAgent       string               `json:"userAgent,omitempty"`
-	Listen          string               `json:"listen,omitempty"`
-	Models          []string             `json:"models,omitempty"`
-	ModelMeta       map[string]ModelMeta `json:"model_meta,omitempty"`
-	Credentials     []Credential         `json:"credentials,omitempty"`
-	Timeout         time.Duration        `json:"timeout,omitempty"`
-	ChunkTimeout    time.Duration        `json:"chunkTimeout,omitempty"`
-	LogLevel        string               `json:"logLevel,omitempty"`
-	LogFormat       string               `json:"logFormat,omitempty"`
-	RetryCount      int                  `json:"retryCount,omitempty"`
-	EmptyRetryCount int                  `json:"emptyRetryCount,omitempty"`
+	Token              string               `json:"-"`
+	DeviceID           string               `json:"deviceId"`
+	InstallID          string               `json:"-"`
+	APIKey             string               `json:"-"`
+	UpstreamAPIKey     string               `json:"-"`
+	BaseURL            string               `json:"baseURL,omitempty"`
+	AppVersion         string               `json:"appVersion,omitempty"`
+	UserAgent          string               `json:"userAgent,omitempty"`
+	Listen             string               `json:"listen,omitempty"`
+	Models             []string             `json:"models,omitempty"`
+	ModelMeta          map[string]ModelMeta `json:"model_meta,omitempty"`
+	Credentials        []Credential         `json:"credentials,omitempty"`
+	Timeout            time.Duration        `json:"timeout,omitempty"`
+	ChunkTimeout       time.Duration        `json:"chunkTimeout,omitempty"`
+	LogLevel           string               `json:"logLevel,omitempty"`
+	LogFormat          string               `json:"logFormat,omitempty"`
+	RetryCount         int                  `json:"retryCount,omitempty"`
+	EmptyRetryCount    int                  `json:"emptyRetryCount,omitempty"`
+	ExposeReasoning    bool                 `json:"exposeReasoning,omitempty"`
+	ReasoningToContent bool                 `json:"reasoningToContent,omitempty"`
+	MinOutputTokens    int                  `json:"minOutputTokens,omitempty"`
 }
 
 // fileConfig mirrors Config but allows deserializing sensitive fields from file.
 type fileConfig struct {
-	Token           string       `json:"token"`
-	DeviceID        string       `json:"deviceId"`
-	InstallID       string       `json:"installId"`
-	APIKey          string       `json:"apiKey"`
-	UpstreamAPIKey  string       `json:"upstreamApiKey"`
-	BaseURL         string       `json:"baseURL"`
-	AppVersion      string       `json:"appVersion"`
-	UserAgent       string       `json:"userAgent"`
-	Listen          string       `json:"listen"`
-	Models          []string     `json:"models"`
-	Credentials     []Credential `json:"credentials"`
-	Timeout         string       `json:"timeout"`
-	ChunkTimeout    string       `json:"chunkTimeout"`
-	LogLevel        string       `json:"logLevel"`
-	LogFormat       string       `json:"logFormat"`
-	RetryCount      int          `json:"retryCount"`
-	EmptyRetryCount int          `json:"emptyRetryCount"`
+	Token              string       `json:"token"`
+	DeviceID           string       `json:"deviceId"`
+	InstallID          string       `json:"installId"`
+	APIKey             string       `json:"apiKey"`
+	UpstreamAPIKey     string       `json:"upstreamApiKey"`
+	BaseURL            string       `json:"baseURL"`
+	AppVersion         string       `json:"appVersion"`
+	UserAgent          string       `json:"userAgent"`
+	Listen             string       `json:"listen"`
+	Models             []string     `json:"models"`
+	Credentials        []Credential `json:"credentials"`
+	Timeout            string       `json:"timeout"`
+	ChunkTimeout       string       `json:"chunkTimeout"`
+	LogLevel           string       `json:"logLevel"`
+	LogFormat          string       `json:"logFormat"`
+	RetryCount         int          `json:"retryCount"`
+	EmptyRetryCount    int          `json:"emptyRetryCount"`
+	ExposeReasoning    *bool        `json:"exposeReasoning"`
+	ReasoningToContent *bool        `json:"reasoningToContent"`
+	MinOutputTokens    *int         `json:"minOutputTokens"`
 }
 
 func Load() Config {
@@ -88,6 +94,15 @@ func Load() Config {
 		LogFormat:       "text",
 		RetryCount:      0,
 		EmptyRetryCount: 2,
+		// Claude Code and most OpenAI-compatible coding clients work best with
+		// final answers/tool calls only. Keep provider-specific reasoning hidden
+		// unless explicitly requested.
+		ExposeReasoning:    false,
+		ReasoningToContent: false,
+		// TeleAgent can spend the first part of the output budget on reasoning.
+		// A floor prevents small client probes from being truncated before final
+		// content or tool calls are emitted.
+		MinOutputTokens: 1024,
 	}
 
 	configPath := getEnv("TELEAGENT_CONFIG", "config.json")
@@ -155,6 +170,15 @@ func Load() Config {
 			if fc.EmptyRetryCount >= 0 {
 				c.EmptyRetryCount = fc.EmptyRetryCount
 			}
+			if fc.ExposeReasoning != nil {
+				c.ExposeReasoning = *fc.ExposeReasoning
+			}
+			if fc.ReasoningToContent != nil {
+				c.ReasoningToContent = *fc.ReasoningToContent
+			}
+			if fc.MinOutputTokens != nil && *fc.MinOutputTokens >= 0 {
+				c.MinOutputTokens = *fc.MinOutputTokens
+			}
 		}
 	}
 
@@ -212,6 +236,17 @@ func Load() Config {
 			c.EmptyRetryCount = n
 		}
 	}
+	if v, ok := os.LookupEnv("TELEAGENT_EXPOSE_REASONING"); ok {
+		c.ExposeReasoning = parseBool(v)
+	}
+	if v, ok := os.LookupEnv("TELEAGENT_REASONING_TO_CONTENT"); ok {
+		c.ReasoningToContent = parseBool(v)
+	}
+	if v, ok := os.LookupEnv("TELEAGENT_MIN_OUTPUT_TOKENS"); ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.MinOutputTokens = n
+		}
+	}
 
 	if len(c.Models) == 0 {
 		modelsStr := getEnv("TELEAGENT_MODELS", "chat-lite,chat-pro,chat-flash")
@@ -265,8 +300,8 @@ func (c Config) SafeSummary() string {
 	if c.APIKey != "" {
 		apiKeyHint = fmt.Sprintf("%s…", c.APIKey[:min(4, len(c.APIKey))])
 	}
-	return fmt.Sprintf("listen=%s upstream=%s token=%s apiKey=%s models=%v timeout=%s chunkTimeout=%s logLevel=%s retryCount=%d emptyRetryCount=%d",
-		c.Listen, c.BaseURL, tokenHint, apiKeyHint, c.Models, c.Timeout, c.ChunkTimeout, c.LogLevel, c.RetryCount, c.EmptyRetryCount,
+	return fmt.Sprintf("listen=%s upstream=%s token=%s apiKey=%s models=%v timeout=%s chunkTimeout=%s logLevel=%s retryCount=%d emptyRetryCount=%d exposeReasoning=%t reasoningToContent=%t minOutputTokens=%d",
+		c.Listen, c.BaseURL, tokenHint, apiKeyHint, c.Models, c.Timeout, c.ChunkTimeout, c.LogLevel, c.RetryCount, c.EmptyRetryCount, c.ExposeReasoning, c.ReasoningToContent, c.MinOutputTokens,
 	)
 }
 
@@ -289,6 +324,15 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+func parseBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func min(a, b int) int {

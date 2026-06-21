@@ -14,5 +14,8 @@
   "logLevel": "info",
   "logFormat": "text",
   "retryCount": 0,
-  "emptyRetryCount": 2
+  "emptyRetryCount": 2,
+  "exposeReasoning": false,
+  "reasoningToContent": false,
+  "minOutputTokens": 1024
 }

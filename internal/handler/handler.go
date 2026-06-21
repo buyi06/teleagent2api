@@ -84,13 +84,19 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 
 		// Sanitize request: strip unsupported params that cause upstream errors
 		// and cap max_tokens to model limits
-		body = adapter.SanitizeRequest(body, cfg.ModelMeta)
+		body = adapter.SanitizeRequestWithOptions(body, cfg.ModelMeta, cfg.MinOutputTokens)
 
 		// Detect if client requested streaming
 		var reqStruct struct {
-			Stream bool `json:"stream"`
+			Stream bool   `json:"stream"`
+			Model  string `json:"model"`
 		}
 		_ = json.Unmarshal(body, &reqStruct)
+		transformOpts := adapter.TransformOptions{
+			ExposeReasoning:          cfg.ExposeReasoning,
+			ReasoningContentFallback: cfg.ReasoningToContent,
+			ModelAlias:               reqStruct.Model,
+		}
 
 		// Total attempts = initial attempt + configured upstream retries +
 		// configured empty-response retries. Keep these knobs separate so
@@ -185,7 +191,7 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 				copyHeaders(w.Header(), resp.Header)
 				w.Header().Del("Content-Length")
 				w.Header().Del("Transfer-Encoding")
-				transformed := adapter.TransformNonStreamingResponse(raw)
+				transformed := adapter.TransformNonStreamingResponseWithOptions(raw, transformOpts)
 				if reqStruct.Stream {
 					// Some upstream paths occasionally return a valid JSON chat
 					// completion even when stream=true. Convert it to a small SSE
@@ -193,7 +199,7 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 					w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 					w.Header().Set("Cache-Control", "no-cache")
 					w.Header().Set("X-Accel-Buffering", "no")
-					transformed = adapter.TransformNonStreamingResponseToSSE(raw)
+					transformed = adapter.TransformNonStreamingResponseToSSEWithOptions(raw, transformOpts)
 				}
 				w.WriteHeader(resp.StatusCode)
 				w.Write(transformed)
@@ -201,7 +207,7 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 			}
 
 			// --- Streaming: buffer until first useful content, then flush-copy ---
-			state := adapter.NewStreamChunkState()
+			state := adapter.NewStreamChunkStateWithOptions(transformOpts)
 			if cfg.ChunkTimeout > 0 {
 				resp.Body = withReadIdleTimeout(resp.Body, cfg.ChunkTimeout)
 			}
