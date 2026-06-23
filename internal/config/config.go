@@ -30,22 +30,32 @@ type Credential struct {
 }
 
 type Config struct {
-	Token          string        `json:"-"`
-	DeviceID       string        `json:"deviceId"`
-	InstallID      string        `json:"-"`
-	APIKey         string        `json:"-"`
-	UpstreamAPIKey string        `json:"-"`
-	BaseURL        string        `json:"baseURL,omitempty"`
-	AppVersion     string        `json:"appVersion,omitempty"`
-	UserAgent      string        `json:"userAgent,omitempty"`
-	Listen         string        `json:"listen,omitempty"`
-	Models         []string      `json:"models,omitempty"`
+	Token          string               `json:"-"`
+	DeviceID       string               `json:"deviceId"`
+	InstallID      string               `json:"-"`
+	APIKey         string               `json:"-"`
+	UpstreamAPIKey string               `json:"-"`
+	BaseURL        string               `json:"baseURL,omitempty"`
+	AppVersion     string               `json:"appVersion,omitempty"`
+	UserAgent      string               `json:"userAgent,omitempty"`
+	Listen         string               `json:"listen,omitempty"`
+	Models         []string             `json:"models,omitempty"`
 	ModelMeta      map[string]ModelMeta `json:"model_meta,omitempty"`
-	Credentials    []Credential  `json:"credentials,omitempty"`
-	Timeout        time.Duration `json:"timeout,omitempty"`
-	LogLevel       string        `json:"logLevel,omitempty"`
-	LogFormat      string        `json:"logFormat,omitempty"`
-	RetryCount     int           `json:"retryCount,omitempty"`
+	Credentials    []Credential         `json:"credentials,omitempty"`
+	Timeout        time.Duration        `json:"timeout,omitempty"`
+	LogLevel       string               `json:"logLevel,omitempty"`
+	LogFormat      string               `json:"logFormat,omitempty"`
+	RetryCount     int                  `json:"retryCount,omitempty"`
+	// ReasoningMode controls how upstream <think>...</think> reasoning is
+	// delivered to the client in streaming mode:
+	//   content          - pass through unchanged (<think> stays in content)
+	//   reasoning_content - split <think> into delta.reasoning_content, answer stays in content (tags stripped)
+	//   visible          - strip <think> tags, stream reasoning as plain content
+	//   strip            - drop reasoning entirely, stream only the answer
+	ReasoningMode string `json:"reasoningMode,omitempty"`
+	// StreamLogEvery controls how often a "stream progress" diagnostic line is
+	// logged during a streaming response (0 disables).
+	StreamLogEvery time.Duration `json:"streamLogEvery,omitempty"`
 }
 
 // fileConfig mirrors Config but allows deserializing sensitive fields from file.
@@ -65,6 +75,8 @@ type fileConfig struct {
 	LogLevel       string       `json:"logLevel"`
 	LogFormat      string       `json:"logFormat"`
 	RetryCount     int          `json:"retryCount"`
+	ReasoningMode  string       `json:"reasoningMode"`
+	StreamLogEvery string       `json:"streamLogEvery"`
 }
 
 func Load() Config {
@@ -79,6 +91,8 @@ func Load() Config {
 		LogLevel:       "info",
 		LogFormat:      "text",
 		RetryCount:     0,
+		ReasoningMode:  "content",
+		StreamLogEvery: 5 * time.Second,
 	}
 
 	configPath := getEnv("TELEAGENT_CONFIG", "config.json")
@@ -135,6 +149,14 @@ func Load() Config {
 			if fc.RetryCount > 0 {
 				c.RetryCount = fc.RetryCount
 			}
+			if fc.ReasoningMode != "" {
+				c.ReasoningMode = fc.ReasoningMode
+			}
+			if fc.StreamLogEvery != "" {
+				if d, err := time.ParseDuration(fc.StreamLogEvery); err == nil {
+					c.StreamLogEvery = d
+				}
+			}
 		}
 	}
 
@@ -182,6 +204,14 @@ func Load() Config {
 			c.RetryCount = n
 		}
 	}
+	if v, ok := os.LookupEnv("TELEAGENT_REASONING_MODE"); ok {
+		c.ReasoningMode = v
+	}
+	if v, ok := os.LookupEnv("TELEAGENT_STREAM_LOG_EVERY"); ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.StreamLogEvery = d
+		}
+	}
 
 	if len(c.Models) == 0 {
 		modelsStr := getEnv("TELEAGENT_MODELS", "chat-lite,chat-pro,chat-flash")
@@ -195,6 +225,9 @@ func Load() Config {
 	if len(c.ModelMeta) == 0 {
 		c.ModelMeta = DefaultModelMeta()
 	}
+
+	// Normalize the reasoning mode to a known value.
+	c.ReasoningMode = normalizeReasoningMode(c.ReasoningMode)
 
 	// Normalize credentials: if the primary token is set and not in the list,
 	// prepend it as the first credential.
@@ -220,6 +253,21 @@ func Load() Config {
 	return c
 }
 
+// normalizeReasoningMode maps the configured value to a supported mode,
+// falling back to "content" (pass-through) for anything unrecognized.
+func normalizeReasoningMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "reasoning_content", "reasoning-content":
+		return "reasoning_content"
+	case "visible":
+		return "visible"
+	case "strip":
+		return "strip"
+	default:
+		return "content"
+	}
+}
+
 // SafeSummary returns a human-readable summary with sensitive fields redacted.
 func (c Config) SafeSummary() string {
 	tokenHint := ""
@@ -230,8 +278,8 @@ func (c Config) SafeSummary() string {
 	if c.APIKey != "" {
 		apiKeyHint = fmt.Sprintf("%s…", c.APIKey[:min(4, len(c.APIKey))])
 	}
-	return fmt.Sprintf("listen=%s upstream=%s token=%s apiKey=%s models=%v timeout=%s logLevel=%s retryCount=%d",
-		c.Listen, c.BaseURL, tokenHint, apiKeyHint, c.Models, c.Timeout, c.LogLevel, c.RetryCount,
+	return fmt.Sprintf("listen=%s upstream=%s token=%s apiKey=%s models=%v timeout=%s logLevel=%s retryCount=%d reasoningMode=%s streamLogEvery=%s",
+		c.Listen, c.BaseURL, tokenHint, apiKeyHint, c.Models, c.Timeout, c.LogLevel, c.RetryCount, c.ReasoningMode, c.StreamLogEvery,
 	)
 }
 

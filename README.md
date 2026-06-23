@@ -12,12 +12,15 @@ OpenAI-Compatible API Gateway for TeleAgent (星辰超级智能体)
 - Built-in API Key authentication
 - Request sanitization — strips unsupported params (logprobs, stop, n, etc.) that cause upstream errors
 - Response adapter — transforms upstream responses to strict OpenAI format
-  - Strips non-standard fields (`reasoning_content`, `request_id`, `system_fingerprint`, etc.)
+  - Configurable reasoning handling (see [Reasoning Modes](#reasoning-modes)) — the upstream emits its
+    chain-of-thought as `<think>...</think>` inside `content`; the gateway can re-route it to
+    `reasoning_content` (OpenAI o1 style / Anthropic `thinking`), keep it inline, or drop it
   - Cleans `usage` to only standard fields
-  - Streaming: skips reasoning-only chunks, `role` only in first content delta
+  - Streaming: emits `role` only in the first delta, drops empty separator chunks
 - Model metadata with context limits and max output tokens
 - Automatic `max_tokens` cap per model
 - 5xx retry with configurable count
+- Streaming progress diagnostics log
 - Configurable via environment variables or `config.json`
 
 ## Models
@@ -125,6 +128,10 @@ Or in `.claude/settings.json`:
 }
 ```
 
+> Tip: `chat-pro` is a reasoning model. Run it with `TELEAGENT_REASONING_MODE=reasoning_content`
+> so the long thinking phase streams as `reasoning_content` (rendered as a live "thinking" block by
+> reasoning-aware clients / gateways) instead of the client appearing frozen while reasoning is hidden.
+
 ## Configuration
 
 Environment variables take precedence over `config.json`.
@@ -141,10 +148,31 @@ Environment variables take precedence over `config.json`.
 | `TELEAGENT_APP_VERSION` | `2.0.0` | Client version header |
 | `TELEAGENT_USER_AGENT` | (built-in) | User-Agent header |
 | `TELEAGENT_MODELS` | `chat-lite,chat-pro,chat-flash` | Available models |
-| `TELEAGENT_TIMEOUT` | `120s` | Request timeout |
+| `TELEAGENT_TIMEOUT` | `300s` | Request timeout (covers the whole stream — keep large for long reasoning) |
 | `TELEAGENT_LOG_LEVEL` | `info` | Log level (debug/info/warn/error) |
 | `TELEAGENT_LOG_FORMAT` | `text` | Log format (text/json) |
 | `TELEAGENT_RETRY_COUNT` | `0` | Retry count on upstream 5xx |
+| `TELEAGENT_REASONING_MODE` | `content` | How `<think>` reasoning is delivered (see below) |
+| `TELEAGENT_STREAM_LOG_EVERY` | `5s` | Interval for the `stream progress` diagnostics log (`0` disables) |
+
+## Reasoning Modes
+
+The TeleAgent upstream (GLM-family) emits its chain-of-thought as a `<think>...</think>` block at the
+**start of the `content` stream**, followed by the real answer. For a complex prompt the thinking phase
+can last minutes. If a downstream client/gateway hides or buffers that `<think>` block, the user sees a
+frozen spinner with no visible progress until the answer finally appears.
+
+`TELEAGENT_REASONING_MODE` controls how the gateway delivers that reasoning (the `<think>` tags are
+matched across chunk boundaries, so partial tags split between SSE frames are handled correctly):
+
+| Mode | Behavior | Use when |
+|------|----------|----------|
+| `content` (default) | Pass through unchanged — `<think>` stays inside `content` | Client already renders `<think>` tags |
+| `reasoning_content` | Split the `<think>` block into `delta.reasoning_content`; the answer stays in `content`; tags stripped | **Recommended.** Reasoning-aware clients (OpenAI o1) and gateways that map `reasoning_content` → Anthropic `thinking` show a live thinking block, answer stays clean |
+| `visible` | Strip the `<think>` tags and stream the reasoning as plain `content` | Client has no reasoning channel but you still want continuous output (reasoning mixes into the answer) |
+| `strip` | Drop the reasoning entirely; stream only the answer | You only want the final answer |
+
+Applies to both streaming and non-streaming responses.
 
 ## Getting Credentials
 
@@ -195,7 +223,7 @@ Client (Claude Code / any OpenAI client)
 2. Adapter sanitizes request (strips unsupported OpenAI params, caps `max_tokens`)
 3. Proxy builds upstream request with HMAC signature
 4. Upstream response is transformed to strict OpenAI format
-5. Streaming: reasoning-only chunks are skipped, `role` emitted only once
+5. Streaming: reasoning is routed per `TELEAGENT_REASONING_MODE`, `role` emitted only once
 
 ## License
 

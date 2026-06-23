@@ -169,30 +169,26 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 				w.Header().Del("Content-Length")
 				w.Header().Del("Transfer-Encoding")
 				w.WriteHeader(resp.StatusCode)
-				transformed := adapter.TransformNonStreamingResponse(raw)
+				transformed := adapter.TransformNonStreamingResponse(raw, cfg.ReasoningMode)
 				w.Write(transformed)
 				return
 			}
 
-			// --- Streaming: copy with flush, check if stream was empty ---
+			// --- Streaming: transform chunks, routing reasoning per mode ---
 			copyHeaders(w.Header(), resp.Header)
 			w.Header().Del("Content-Length")
 			w.Header().Del("Transfer-Encoding")
 			w.WriteHeader(resp.StatusCode)
 
-			state := adapter.NewStreamChunkState()
-			transformFlushCopy(w, r, resp.Body, state)
+			proc := adapter.NewStreamProcessor(cfg.ReasoningMode)
+			hasContent := streamCopy(w, r, resp.Body, proc, cfg)
 			resp.Body.Close()
 
-			// If stream produced zero content chunks, retry with different credential
-			if !state.HasContent() && attempt < maxAttempts-1 {
-				slog.WarnContext(r.Context(), "upstream stream was empty, retrying",
-					slog.Int("attempt", attempt+1),
-				)
-				// Can't retry: response headers already sent to client.
-				// Log for diagnostics. Future improvement: buffer first N chunks
-				// before committing to the response writer.
+			// If stream produced zero content chunks, we cannot retry because the
+			// response headers were already committed. Log for diagnostics.
+			if !hasContent && attempt < maxAttempts-1 {
 				slog.WarnContext(r.Context(), "empty stream cannot be retried (headers already sent)",
+					slog.Int("attempt", attempt+1),
 					slog.String("request_id", middleware.GetRequestID(r.Context())),
 				)
 			}
@@ -204,75 +200,134 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 	}
 }
 
-
-// transformFlushCopy reads SSE lines from upstream, transforms each data
-// payload to be OpenAI-compatible, and flushes to the client.
-func transformFlushCopy(w http.ResponseWriter, r *http.Request, body io.Reader, state *adapter.StreamChunkState) {
-	flusher, ok := w.(http.Flusher)
+// streamCopy reads SSE lines from upstream, transforms each via the
+// StreamProcessor (which may emit multiple OpenAI chunks per upstream chunk),
+// and flushes to the client. It logs periodic progress for diagnostics and
+// returns whether any content/reasoning was emitted.
+func streamCopy(w http.ResponseWriter, r *http.Request, body io.Reader, proc *adapter.StreamProcessor, cfg config.Config) bool {
+	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(body)
 	ctx := r.Context()
+	reqID := middleware.GetRequestID(ctx)
+
+	start := time.Now()
+	lastLog := start
+	firstByteLogged := false
+	var chunks, bytesOut int
+
+	writeOut := func(b []byte) bool {
+		n, err := w.Write(b)
+		bytesOut += n
+		if err != nil {
+			slog.WarnContext(ctx, "streamCopy: client disconnected",
+				slog.String("error", err.Error()),
+				slog.String("request_id", reqID),
+			)
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
 
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			transformed, skip := transformSSELine(line, state)
-			if !skip {
-				if _, writeErr := w.Write(transformed); writeErr != nil {
-					slog.WarnContext(ctx, "transformFlushCopy: client disconnected",
-						slog.String("error", writeErr.Error()),
-						slog.String("request_id", middleware.GetRequestID(ctx)),
-					)
-					return
-				}
-				if ok {
-					flusher.Flush()
-				}
-			}
-		}
-		if err != nil {
-			if err != io.EOF {
-				slog.WarnContext(ctx, "transformFlushCopy: upstream read error",
-					slog.String("error", err.Error()),
+			if !firstByteLogged {
+				firstByteLogged = true
+				slog.InfoContext(ctx, "stream first byte",
+					slog.String("request_id", reqID),
+					slog.String("reasoning_mode", cfg.ReasoningMode),
+					slog.Duration("first_byte_after", time.Since(start)),
 				)
 			}
-			return
+			for _, out := range transformSSELineMulti(line, proc) {
+				if !writeOut(out) {
+					return proc.HasContent()
+				}
+				chunks++
+			}
+		}
+
+		if cfg.StreamLogEvery > 0 && time.Since(lastLog) >= cfg.StreamLogEvery {
+			lastLog = time.Now()
+			slog.InfoContext(ctx, "stream progress",
+				slog.String("request_id", reqID),
+				slog.String("reasoning_mode", cfg.ReasoningMode),
+				slog.Duration("elapsed", time.Since(start)),
+				slog.Int("chunks", chunks),
+				slog.Int("bytes", bytesOut),
+			)
+		}
+
+		if err != nil {
+			// Flush any buffered partial reasoning/answer at end of stream.
+			for _, out := range proc.Flush() {
+				if !writeOut(out) {
+					return proc.HasContent()
+				}
+				chunks++
+			}
+			if err != io.EOF {
+				slog.WarnContext(ctx, "streamCopy: upstream read error",
+					slog.String("error", err.Error()),
+					slog.String("request_id", reqID),
+				)
+			}
+			slog.InfoContext(ctx, "stream completed",
+				slog.String("request_id", reqID),
+				slog.String("reasoning_mode", cfg.ReasoningMode),
+				slog.Duration("elapsed", time.Since(start)),
+				slog.Int("chunks", chunks),
+				slog.Int("bytes", bytesOut),
+			)
+			return proc.HasContent()
 		}
 
 		select {
 		case <-ctx.Done():
-			slog.DebugContext(ctx, "transformFlushCopy: context cancelled, stopping copy")
-			return
+			slog.InfoContext(ctx, "stream cancelled",
+				slog.String("request_id", reqID),
+				slog.String("reasoning_mode", cfg.ReasoningMode),
+				slog.Duration("elapsed", time.Since(start)),
+				slog.Int("chunks", chunks),
+				slog.Int("bytes", bytesOut),
+			)
+			return proc.HasContent()
 		default:
 		}
 	}
 }
 
-// transformSSELine transforms a single SSE line. Only "data: " lines with
-// JSON payloads are transformed; everything else passes through unchanged.
-// Returns (output, skip). If skip is true, this line should be dropped.
-func transformSSELine(line []byte, state *adapter.StreamChunkState) ([]byte, bool) {
-	trimmed := strings.TrimRight(string(line), "\r\n")
-	if !strings.HasPrefix(trimmed, "data: ") {
-		return line, false
+// transformSSELineMulti transforms a single upstream SSE line into zero or more
+// OpenAI-compatible "data: ...\n\n" events. Blank separator lines are dropped
+// (we emit our own terminators); non-data lines pass through unchanged.
+func transformSSELineMulti(line []byte, proc *adapter.StreamProcessor) [][]byte {
+	s := strings.TrimRight(string(line), "\r\n")
+	if s == "" {
+		return nil
 	}
-
-	payload := strings.TrimPrefix(trimmed, "data: ")
-
-	// "data: [DONE]" passes through as-is
+	if !strings.HasPrefix(s, "data: ") {
+		return [][]byte{line}
+	}
+	payload := strings.TrimPrefix(s, "data: ")
 	if payload == "[DONE]" {
-		return line, false
+		return [][]byte{[]byte("data: [DONE]\n\n")}
 	}
-
-	transformed, skip := state.TransformChunk([]byte(payload))
-	if skip {
-		return nil, true
+	outs := proc.ProcessChunk([]byte(payload))
+	if len(outs) == 0 {
+		return nil
 	}
-
-	var sb strings.Builder
-	sb.WriteString("data: ")
-	sb.Write(transformed)
-	sb.WriteString("\n")
-	return []byte(sb.String()), false
+	res := make([][]byte, 0, len(outs))
+	for _, pld := range outs {
+		buf := make([]byte, 0, len(pld)+8)
+		buf = append(buf, "data: "...)
+		buf = append(buf, pld...)
+		buf = append(buf, '\n', '\n')
+		res = append(res, buf)
+	}
+	return res
 }
 
 // proxyResponseHeaderBlacklist lists upstream headers that should never be
